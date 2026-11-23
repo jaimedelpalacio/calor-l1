@@ -69,7 +69,8 @@ def _clave_admin(x_api_key: Optional[str]) -> None:
 
 VIS_FORMATO = ("vis: [[lat, lon, pct], ...] por cada sitio con calor en el barrido o en las 24 h anteriores (máx. 60); "
                "lat/lon exactamente como en calor[] (4 decimales); pct = % (1 decimal) de píxeles del recorte a <= 2 km "
-               "que son nube en la máscara final del barrido (sin dato = nube; sin píxeles cerca = 100)")
+               "que no se ven: nube en la máscara final del barrido o sin el 65 % de vecinos despejados para juzgarlos "
+               "(sin dato = nube; sin píxeles cerca = 100)")
 
 
 @app.on_event("startup")

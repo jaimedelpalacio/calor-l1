@@ -335,6 +335,52 @@ comprobar(len({h.slot for h in m.motor.hist}) == len(m.motor.hist), "reconstruir
 s2.latido = dt.datetime.now(UTC)
 s2.ultimo_ok = dict(s2.ultimo_ok, fondo_barridos=6, pix_vigilados=0, vigilado=False, nube_pct=100.0)
 comprobar(s2.salud()["estado"] == "nublado", f"todo cubierto: «nublado» ({s2.salud()['estado']})")
+# nubes sueltas: hay claros con fondo, pero ninguno con el 65 % de vecinos despejados (G6) → «nublado», no «sin_fondo»
+s2.ultimo_ok = dict(s2.ultimo_ok, fondo_barridos=6, pix_vigilados=0, pix_con_fondo=40, vigilado=False, nube_pct=60.0)
+comprobar(s2.salud()["estado"] == "nublado", f"claros con fondo pero sin vecinos despejados: «nublado» ({s2.salud()['estado']})")
+inicio = s2.inicio
+s2.inicio = dt.datetime.now(UTC) - dt.timedelta(hours=2)
+s2.ultimo_ok = dict(s2.ultimo_ok, fondo_barridos=1, pix_vigilados=0, pix_con_fondo=0, vigilado=False, nube_pct=10.0)
+comprobar(s2.salud()["estado"] == "sin_fondo", f"despejado y sin fondo de verdad: «sin_fondo» ({s2.salud()['estado']})")
+s2.inicio = inicio
+
+# G6 con G4 y G5 (motor solo): una nube fría a la izquierda del píxel (20, 20) deja despejada menos del 65 % de su
+# ventana 11×11; hasta la columna 18, su dilatación tapa el píxel (lo salva G4); hasta la 17, el píxel queda despejado
+def anillo(b38, b105, hasta=18):
+    b105 = b105.copy()
+    b105[10:31, 10:hasta + 1] = 250.0
+    return b38, b105
+
+
+for g4, nombre in ((True, "con calor propio (G4) se juzga aunque falten vecinos (G6 no anula a G4)"),
+                   (False, "sin G4, el mismo píxel no se juzga (G6)")):
+    mg = MOT.Motor(s.zona, MOT.Parametros(calor_propio=8.0 if g4 else float("inf")))
+    t_g = base - dt.timedelta(days=4)
+    for k in range(7):
+        b38, b105, _ = leer_falso("x", None)
+        if k == 6:
+            b38[20, 20] += 15
+            b38, b105 = anillo(b38, b105)
+        r = mg.procesa(t_g + dt.timedelta(minutes=10 * k), b38, b105, REC)
+    comprobar((len(r["calor"]) >= 1) == g4 and r["pix_con_fondo"] > r["pix_vigilados"], f"{nombre} ({len(r['calor'])} con calor)")
+
+# G5 con G6: con racha abierta, despejado pero sin vecinos → su valor caliente NO entra en el fondo
+mg = MOT.Motor(s.zona, MOT.Parametros(calor_propio=float("inf")))
+t_g = base - dt.timedelta(days=5)
+for k in range(9):
+    b38, b105, _ = leer_falso("x", None)
+    if k >= 6:
+        b38[20, 20] += 15
+    if k == 7:
+        b38, b105 = anillo(b38, b105, hasta=17)
+    r = mg.procesa(t_g + dt.timedelta(minutes=10 * k), b38, b105, REC)
+    if k == 7:
+        r7 = r
+h7 = next(h for h in mg.hist if h.slot == t_g + dt.timedelta(minutes=70))
+comprobar(len(r7["calor"]) == 0 and r7["pix_fondo_congelado"] >= 1 and abs(float(h7.S38[20, 20])) < 2 and len(r["calor"]) >= 1,
+          f"racha abierta sin vecinos (G6): no se juzga, pero su fondo sigue congelado y luego sigue sonando "
+          f"(fondo {float(h7.S38[20, 20]):.1f} K)")
+
 
 # CAS caído con el access aún válido: NO es «sin_token»
 cas["modo"] = "caido"

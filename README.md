@@ -13,7 +13,7 @@ Vigilancia de **calor** en una zona (hoy: Alcalá de Guadaíra + 1 km) con el **
 
 Cada minuto mira en el Data Store de EUMETSAT (API v2) si hay un barrido nuevo de la colección
 `EO:EUM:DAT:0665`. Si lo hay, baja **solo el trozo 34** (filas de 36,4 a 40,0° N, ~19 MB), lee el recorte
-de la zona (la zona + 13 píxeles alrededor) y aplica el mismo algoritmo que `scripts/investigacion-calor/fci_alarma.py`
+de la zona (la zona + 15 píxeles alrededor) y aplica el mismo algoritmo que `scripts/investigacion-calor/fci_alarma.py`
 (ver `motor.py`):
 
 - **lectura**: recuentos fuera de `valid_range` o de relleno y píxeles con avisos de calidad que falsean la radiancia
@@ -29,6 +29,11 @@ de la zona (la zona + 13 píxeles alrededor) y aplica el mismo algoritmo que `sc
   con fondo válido en la última hora.
 - **fondo congelado**: un píxel con calor no mete su valor en el fondo (guarda el que tenía), como mucho 6 h seguidas.
   Sin esto, el incendio se «comía» su propio fondo y dejaba de verse a los 3-4 barridos.
+- **vecinos suficientes**: un píxel solo se juzga si al menos el 65 % de su ventana 11×11 está despejada (Hally y otros,
+  2018: el fondo contextual se degrada con pocos vecinos válidos). En los 10 días de ajuste quita la única falsa alarma
+  clara (un borde de nube) sin perder ni acortar ningún incendio. Los píxeles que no se juzgan no cuentan como vigilados.
+  Un píxel con calor propio se juzga aunque le falten vecinos (G6 no anula a G4), y uno con racha de calor abierta que
+  hoy no se juzga por falta de vecinos sigue con el fondo congelado (si no, el incendio se callaría al volver a juzgarse).
 
 **Barridos que llegan mal**:
 - publicados tarde (detrás de uno más nuevo): si llegan < 30 min después de su fin, se analizan y se guardan en su
@@ -65,7 +70,8 @@ No hay `/docs`, `/redoc` ni `/openapi.json`.
 
 `slot`, `barrido_ini`, `barrido_fin` (paso del trozo 34), `creado` (fichero), `visto` (en el catálogo), `analizado`,
 `retraso_min`, `arranque` (sin fondo aún), `vigilado`, `tarde`, `nube_pct` (% de la zona con nube), `pix_zona`,
-`pix_vigilados` (despejados y con fondo), `cobertura_pct` (= `pix_vigilados` / `pix_zona`, %), `fondo_barridos`,
+`pix_con_fondo` (despejados y con fondo, antes de exigir vecinos), `pix_vigilados` (los que se juzgan: con fondo y con
+el 65 % de vecinos despejados o con calor propio), `cobertura_pct` (= `pix_vigilados` / `pix_zona`, %), `fondo_barridos`,
 `pix_fondo_congelado`, `sol_elev`, `maximo` (`t38`, `lat`, `lon` de la señal más alta aunque no llegue al umbral),
 `n_calor` y `calor` (hasta 50 píxeles: `lat`, `lon`, `t38`, `td`, `bt38`, `bt105`, `en` municipio/margen, `dist_km`,
 `intenso`, `racha_min` = minutos seguidos con calor), y **`vis`**. Los no analizados llevan `error` (y `hueco` o `tarde`).
@@ -75,7 +81,8 @@ las 24 h anteriores (sin repetir, como mucho 60, primero los del barrido —solo
 luego del más reciente al más antiguo).
 `lat` y `lon` son **exactamente** los de `calor[]` (4 decimales); `pct` (1 decimal) es el % de los píxeles del
 recorte a ≤ 2 km del sitio que son nube en la máscara final del barrido (la dilatada; los píxeles con calor propio no
-cuentan como nube; los que no tienen dato, sí). Sin píxeles a ≤ 2 km: 100. Sirve para saber si un sitio se ve: una
+cuentan como nube; los que no tienen dato, sí) **o no se pueden juzgar por no tener el 65 % de vecinos despejados**
+(G6: lo que no se juzga tampoco «se ve»). Sin píxeles a ≤ 2 km: 100. Sirve para saber si un sitio se ve: una
 nube encima del fuego con la zona despejada no es «el calor ha terminado». La respuesta de `/estado` lo recuerda
 en `vis_formato`.
 
@@ -85,9 +92,9 @@ en `vis_formato`.
 |---|---|
 | `ok` | vigilando: último barrido analizado hace poco, con fondo, con suelo visible y ≥ 50 % de la zona vigilada |
 | `parcial` | vigilando, pero menos del 50 % de la zona (`cobertura_pct` < 50: nubes o falta de fondo). No es un fallo |
-| `nublado` | zona cubierta (≥ 95 % de nubes y nada vigilado): no se ve el suelo (no es un fallo, pero no se vigila) |
+| `nublado` | nada vigilado por las nubes: zona cubierta (≥ 95 %), o los claros que tienen fondo no tienen el 65 % de vecinos despejados (`pix_con_fondo` > 0). No es un fallo, pero no se vigila |
 | `arrancando` | recién arrancado: aún no ha analizado un barrido en este proceso o le falta la hora de fondo |
-| `sin_fondo` | > 45 min en marcha y el último barrido sin ningún píxel con fondo suficiente |
+| `sin_fondo` | > 45 min en marcha, nada vigilado y ningún píxel despejado con fondo (`pix_con_fondo` = 0) sin estar cubierto: falta de verdad la hora de fondo |
 | `atrasado` | el último barrido analizado terminó (slot + 10 min) hace más de 30 min: unos 40 min desde su inicio |
 | `error` | en este proceso: barridos que fallan (≥ 3 intentos), el último cerrado en orden con error, o 3 vueltas seguidas fallidas |
 | `parado` | el bucle lleva > 8 min sin latido |
@@ -139,7 +146,7 @@ comparten un refresh token, el primero que renueve deja sin acceso al otro. UN S
   cada día, con 5 y con 1 km; `vis` igual a la calculada con la máscara del análisis; y un reinicio a mitad de un
   incendio (fondo guardado y cargado) sigue exactamente igual. **No** prueba la lectura del fichero ni el bucle.
 - `python pruebas/prueba_lectura.py <carpeta investigacion-calor>`: con un trozo 34 real, la temperatura de brillo es
-  idéntica a la del análisis validado, el recorte deja 13 píxeles, el tamaño del recorte no cambia la zona, y las
+  idéntica a la del análisis validado, el recorte deja 15 píxeles, el tamaño del recorte no cambia la zona, y las
   comprobaciones de proyección, `valid_range` y calidad.
 - `python pruebas/prueba_servicio.py`: el bucle y el token con EUMETSAT simulado (arranque, reinicio con `fondo.npz`,
   barridos tardíos, huecos, fallos, estados de `/health`, `vis`, claves). Necesita las dependencias de `requirements.txt`.

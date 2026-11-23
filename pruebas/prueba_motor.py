@@ -44,10 +44,16 @@ for margen in margenes:
     zona = Zona(str(Path(__file__).resolve().parents[1] / "zonas" / "alcala.geojson"), margen)
     for g4, g5 in configs:
         p = Parametros(umbral=A, calor_propio=8.0 if g4 else math.inf, congelar_max_min=360 if g5 else 0)
-        fallos, total_ref, total_srv, iguales, congelados, vis_n, vis_mal = 0, 0, 0, 0, 0, 0, 0
+        fallos, iguales, vis_mal, dias, ilegibles = 0, 0, 0, 0, []
         for f in sorted((base / "datos" / "fci").glob("*.npz")):
             dia = f.stem
-            z = np.load(f)
+            try:                                      # puede haber uno a medio escribir (descarga en marcha)
+                z = np.load(f)
+                z = {x: z[x] for x in ("bt38", "bt105", "lat", "lon")}
+            except Exception:
+                ilegibles.append(dia)
+                continue
+            dias += 1
             la, lo = z["lat"], z["lon"]
             ex, ny = A_UTM.transform(lo, la)
             en_muni = contains_xy(zona.muni, ex, ny)
@@ -66,8 +72,7 @@ for margen in margenes:
                 slot = t0 + dt.timedelta(minutes=10 * k)
                 r = m.procesa(slot, z["bt38"][k].astype(float), z["bt105"][k].astype(float), rec, previos=previos)
                 previos.append({"slot": slot.strftime("%Y-%m-%dT%H:%M:%SZ"), "calor": r["calor"][:50]})
-                congelados += r["pix_fondo_congelado"]
-                # «vis» calculada aparte con la máscara FINAL del análisis validado y sus alarmas
+                # «vis» calculada aparte con lo que el análisis no ve (nube o sin vecinos despejados) y sus alarmas
                 for i, j in zip(*np.where(ref[k])):
                     s_ = (round(float(la[i, j]), 4), round(float(lo[i, j]), 4))
                     if s_ not in sitios_ref:
@@ -75,25 +80,22 @@ for margen in margenes:
                 esperado = {}
                 for a_, b_ in sitios_ref:
                     cerca = np.hypot((la - a_) * 111.2, (lo - b_) * 111.2 * math.cos(math.radians(a_))) <= 2.0
-                    esperado[(a_, b_)] = round(100.0 * float(R["mascara"][k][cerca].sum()) / int(cerca.sum()), 1)
+                    esperado[(a_, b_)] = round(100.0 * float(R["no_visto"][k][cerca].sum()) / int(cerca.sum()), 1)
                 obtenido = {(v[0], v[1]): v[2] for v in r["vis"]}
-                if len(sitios_ref) < 60:
-                    vis_n += len(obtenido)
-                    if obtenido != esperado:
-                        vis_mal += 1
-                        print(f"  VIS DISTINTA {dia} {k // 6:02d}:{k % 6 * 10:02d}: {esperado} / {obtenido}")
+                if len(sitios_ref) < 60 and obtenido != esperado:
+                    vis_mal += 1
+                    print(f"  «vis» DISTINTA {dia} {k // 6:02d}:{k % 6 * 10:02d}")
                 srv = {(c["lat"], c["lon"]) for c in r["calor"]}
                 rr = {(round(float(la[i, j]), 4), round(float(lo[i, j]), 4)) for i, j in zip(*np.where(ref[k]))}
-                total_ref += len(rr)
-                total_srv += len(srv)
                 if srv == rr:
                     iguales += 1
-                else:
+                else:                                 # solo dónde: no se enseñan resultados (días de validación)
                     fallos += 1
-                    print(f"  DIFERENCIA {dia} {k // 6:02d}:{k % 6 * 10:02d}: análisis {sorted(rr)} / servicio {sorted(srv)}")
-        print(f"{margen:g} km, G4 {'sí' if g4 else 'no'}, G5 {'sí' if g5 else 'no'}: píxeles con calor: análisis {total_ref}, "
-              f"servicio {total_srv}; barridos iguales {iguales}; diferencias {fallos}; píxel·barridos con fondo congelado {congelados}; "
-              f"«vis»: {vis_n} sitio·barridos, {vis_mal} barridos distintos")
+                    print(f"  DIFERENCIA {dia} {k // 6:02d}:{k % 6 * 10:02d}: {len(rr ^ srv)} píxeles distintos")
+        # solo la equivalencia: ni cuántas alarmas ni dónde (en la carpeta puede haber días de validación)
+        print(f"{margen:g} km, G4 {'sí' if g4 else 'no'}, G5 {'sí' if g5 else 'no'}: {dias} días; barridos iguales {iguales}; "
+              f"diferencias {fallos}; «vis» distinta en {vis_mal} barridos"
+              + (f"; sin leer (¿a medio escribir?): {', '.join(ilegibles)}" if ilegibles else ""))
         total_fallos += fallos + vis_mal
 
 # reinicio a mitad de un incendio (E1, 7-sep-2026, y E6, 30-jun-2025): guardar el fondo y seguir con un motor nuevo

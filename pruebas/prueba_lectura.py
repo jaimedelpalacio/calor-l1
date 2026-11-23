@@ -5,7 +5,7 @@
 #
 # Usa descargas/prueba/mtg_l1/hr_trozo_34.nc (no llama a EUMETSAT). Comprueba:
 #   1. temperatura de brillo a 3,8 y 10,5 µm idéntica en todos los píxeles comunes, y la zona validada dentro del recorte;
-#   2. el recorte deja ≥ 13 píxeles alrededor de la zona (con 5 y con 1 km);
+#   2. el recorte deja ≥ MARGEN_PX (15) píxeles alrededor de la zona (con 5 y con 1 km);
 #   3. nubes y anomalías S38/SD de la zona iguales con el recorte del servicio y con el del análisis (el borde no influye);
 #   4. proyección distinta o eje x sin espejo → error permanente y claro;
 #   5. recuentos fuera de valid_range, _FillValue y avisos de calidad que falsean → NaN; saturación y rango extendido, no.
@@ -71,8 +71,8 @@ for km in (5.0, 1.0):
 
 # 3. el tamaño del recorte no cambia nubes ni anomalías dentro de la zona (un barrido, sin fondo)
 mot = M.Motor(z5)
-n1, s1, d1, _ = mot.mascara(b38, b105, [])
-n2, s2, d2, _ = mot.mascara(a38.astype(float), a105.astype(float), [])
+n1, s1, d1, _, _ = mot.mascara(b38, b105, [])
+n2, s2, d2, _, _ = mot.mascara(a38.astype(float), a105.astype(float), [])
 pos1 = {(round(float(x), 6), round(float(y), 6)): (n, s, e) for x, y, n, s, e in
         zip(rec.lat[rec.en_zona], rec.lon[rec.en_zona], n1[rec.en_zona], s1[rec.en_zona], d1[rec.en_zona])}
 iguales = all(np.isclose(pos1[(round(float(x), 6), round(float(y), 6))][1], s, equal_nan=True)
