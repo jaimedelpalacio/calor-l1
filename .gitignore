@@ -1,0 +1,4 @@
+datos-local/
+__pycache__/
+*.pyc
+.claude/
