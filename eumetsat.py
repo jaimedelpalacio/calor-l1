@@ -5,8 +5,12 @@
 #   - El refresh vigente vive en memoria (self._rt) y en disco (DATA_DIR/tokens.json, escrito con fsync).
 #     Si el disco falla, se sigue con el de memoria y se reintenta guardarlo en cada uso (error visible).
 #   - Un candidato nuevo (POST /admin/token) se PRUEBA antes de sustituir al bueno.
-#   - Cerrojo entre procesos (flock) durante la renovación: dos procesos no deben rotar el mismo token.
-#   - Como mucho una renovación forzada (por un 401) cada 15 min.
+#   - Cerrojo entre procesos (flock) durante la renovación y al reintentar el guardado: se relee el disco antes
+#     (si otro proceso dejó uno nuevo, manda ese) para no pisar un token más nuevo con uno viejo.
+#   - Cada rotación es un riesgo (si se pierde la respuesta de CAS, el viejo ya no vale): espera de hasta 20 s a
+#     CAS (por debajo del plazo de apagado de Render, ver TIMEOUT_CAS) y la renovación forzada por un 401 de
+#     descarga, solo con el access cerca de caducar o como mucho
+#     2 veces al día (y nunca dos en menos de 15 min).
 # Nunca se escriben los tokens en el log ni en las respuestas.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
@@ -36,6 +40,11 @@ CLIENT_ID = "api-public-auth-code"
 UTC = dt.timezone.utc
 PLAZO_DESCARGA_S = 150               # tiempo TOTAL máximo de una descarga de ~19 MB
 MIN_ENTRE_FORZADAS_S = 900
+MAX_FORZADAS_DIA = 2
+# Al apagar (redespliegue), Render espera ~30 s antes de matar el proceso: una renovación en curso debe acabar y
+# guardar el refresh nuevo antes. Por eso la espera a CAS (5 + 20 s) queda por debajo de ESPERA_APAGADO_S (27 s).
+TIMEOUT_CAS = (5, 20)                # (conexión, lectura)
+ESPERA_APAGADO_S = 27
 
 
 class TokenError(Exception):
@@ -46,13 +55,13 @@ class TokenError(Exception):
         self.permanente = permanente
 
 
-def escribir_atomico(ruta: Path, texto: str) -> None:
-    """Escribe con fichero temporal + fsync + os.replace (+ fsync de la carpeta). No deja temporales."""
+def escribir_atomico(ruta: Path, contenido) -> None:
+    """Escribe (texto o bytes) con fichero temporal + fsync + os.replace (+ fsync de la carpeta). No deja temporales."""
     ruta.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(ruta.parent), prefix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(texto)
+        with (os.fdopen(fd, "wb") if isinstance(contenido, bytes) else os.fdopen(fd, "w", encoding="utf-8")) as f:
+            f.write(contenido)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, ruta)
@@ -75,8 +84,10 @@ class Token:
         self.ruta = ruta
         self._lock = threading.Lock()
         self._rt: Optional[str] = None
+        self._rt_disco: Optional[str] = None     # el último refresh que este proceso leyó o escribió en disco
         self._sin_guardar = False
         self._ultima_forzada = 0.0
+        self._forzadas: list[float] = []
         self.access: Optional[str] = None
         self.caduca: Optional[float] = None
         self.margen = 1800.0
@@ -85,16 +96,28 @@ class Token:
         self.error_permanente = False
         self.cerrando = False                 # al apagar: no empezar renovaciones nuevas
         self._ultimo_intento_muerto = 0.0
-        with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
-            self._rt = json.loads(self.ruta.read_text(encoding="utf-8"))["refresh_token"] or None
+        self._rt = self._rt_disco = self._leer_disco()
 
     # ---------- disco
+    def _leer_disco(self) -> Optional[str]:
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+            return json.loads(self.ruta.read_text(encoding="utf-8"))["refresh_token"] or None
+        return None
+
     def _guardar(self, rt: str) -> None:
         try:
             escribir_atomico(self.ruta, json.dumps({"refresh_token": rt, "guardado": dt.datetime.now(UTC).isoformat()}))
             self._sin_guardar = False
+            self._rt_disco = rt
         except OSError:
             self._sin_guardar = True          # se sigue con el de memoria y se reintenta en el próximo uso
+
+    def _sincronizar_disco(self) -> None:
+        """(Con el cerrojo puesto.) Si otro proceso escribió un refresh después que nosotros, manda el del disco."""
+        disco = self._leer_disco()
+        if disco and disco != self._rt_disco and disco != self._rt:
+            self._rt = self._rt_disco = disco
+            self._sin_guardar = False
 
     @contextlib.contextmanager
     def _cerrojo(self):
@@ -116,7 +139,7 @@ class Token:
     def _pedir(self, rt: str) -> dict:
         try:
             r = requests.post(CAS_TOKEN, data={"grant_type": "refresh_token", "refresh_token": rt,
-                                               "client_id": CLIENT_ID}, timeout=(5, 15))
+                                               "client_id": CLIENT_ID}, timeout=TIMEOUT_CAS)
         except requests.RequestException as e:
             raise TokenError(f"renovación sin respuesta ({type(e).__name__})", permanente=False)
         if r.status_code in (400, 401, 403):
@@ -138,11 +161,7 @@ class Token:
             raise TokenError(self.error or "token rechazado", permanente=True)   # no insistir: esperar a /admin/token
         with self._cerrojo():
             if candidato is None:
-                # otro proceso pudo rotarlo: el del disco manda si es distinto
-                with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
-                    disco = json.loads(self.ruta.read_text(encoding="utf-8"))["refresh_token"]
-                    if disco and disco != self._rt and not self._sin_guardar:
-                        self._rt = disco
+                self._sincronizar_disco()        # otro proceso pudo rotarlo: si escribió después, manda el del disco
             rt = candidato or self._rt
             if not rt:
                 self.error, self.error_permanente = "no hay refresh token: cargar uno con POST /admin/token", True
@@ -179,11 +198,20 @@ class Token:
     def get(self, forzar: bool = False) -> str:
         with self._lock:
             if self._sin_guardar and self._rt:
-                self._guardar(self._rt)
-            if forzar and time.time() - self._ultima_forzada < MIN_ENTRE_FORZADAS_S and self.access:
-                forzar = False                 # un 401 permanente no debe rotar el token cada minuto
+                with self._cerrojo():          # releer antes: no pisar un refresh más nuevo de otro proceso
+                    self._sincronizar_disco()
+                    if self._sin_guardar:
+                        self._guardar(self._rt)
+            if forzar and self.access:
+                # un 401 que no es del token (licencia, permisos…) no debe rotarlo sin parar: cada rotación es un riesgo
+                ahora = time.time()
+                cerca = self.caduca is not None and ahora > self.caduca - 2 * self.margen
+                self._forzadas = [t for t in self._forzadas if ahora - t < 86400]
+                if ahora - self._ultima_forzada < MIN_ENTRE_FORZADAS_S or (not cerca and len(self._forzadas) >= MAX_FORZADAS_DIA):
+                    forzar = False
             if forzar:
                 self._ultima_forzada = time.time()
+                self._forzadas.append(self._ultima_forzada)
             if forzar or not self.access or not self.caduca or time.time() > self.caduca - self.margen:
                 try:
                     self._renovar()

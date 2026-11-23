@@ -1,23 +1,31 @@
 # motor.py — análisis del nivel 1 de MTG FCI (alta resolución) para vigilar calor en una zona.
 # -----------------------------------------------------------------------------
-# Lo mismo que se validó el 23-nov-2026 con 6 episodios de Alcalá de Guadaíra y 10 días enteros
-# (scripts/investigacion-calor/fci_alarma.py):
-#   NUBE (dilatada 2 píxeles) si  BT105 < 265 K
-#                             o   BT105 − mediana 11×11 < −3 K
-#                             o   BT105 − mediana de los barridos de la última hora < −3 K
+# El MISMO algoritmo que scripts/investigacion-calor/fci_alarma.py (validado con 6 episodios de Alcalá de
+# Guadaíra y 10 días enteros; pruebas/prueba_motor.py comprueba que dan las mismas alarmas barrido a barrido):
+#   NUBE PROPIA si  BT105 < 265 K
+#               o   BT105 − mediana 11×11 < −3 K
+#               o   BT105 − mediana del fondo de BT105 en la última hora < −3 K
+#   NUBE = nube propia dilatada 2 píxeles, SALVO en los píxeles con CALOR PROPIO (G4): sin nube propia y con
+#     BT38 ≥ 8 K y (BT38−BT105) ≥ 7,5 K por encima de la mediana 11×11 de sus vecinos sin nube propia.
+#     (El humo del incendio enfría el 10,5 µm de los vecinos y la dilatación tapaba el propio fuego.)
 #   En píxeles despejados:
-#     S38 = BT38 − mediana 11×11 (solo despejados)     T38 = S38 − mediana de S38 en la última hora
-#     SD  = (BT38−BT105) − mediana 11×11               TD  = SD  − mediana de SD  en la última hora
+#     S38 = BT38 − mediana 11×11 (solo despejados)     T38 = S38 − mediana del fondo de S38 en la última hora
+#     SD  = (BT38−BT105) − mediana 11×11               TD  = SD  − mediana del fondo de SD  en la última hora
 #   CALOR si T38 > UMBRAL, TD > UMBRAL − 0,5 y TD − T38 ≤ 0,7 K (el 10,5 µm no se enfría: así se
-#   descarta el sol reflejado en bordes de nube), en la zona vigilada y con ≥ 3 barridos válidos
+#   descarta el sol reflejado en bordes de nube), en la zona vigilada y con ≥ 3 barridos con fondo válido
 #   en la última hora para ese píxel.
-# ⚠️ El eje x del FCI L1c va en espejo: la coordenada real de la proyección es −x·H.
+#   FONDO (G5): un píxel con CALOR no mete en el fondo su valor sino el fondo que tenía (S38, SD y BT105
+#   congelados), como mucho 6 h seguidas; así el incendio no se «come» su fondo a los 3-4 barridos.
+# Lectura: recuentos fuera de valid_range, _FillValue y avisos de calidad que falsean radiancia o posición → NaN.
+# ⚠️ El eje x del FCI L1c va en espejo: la coordenada real de la proyección es −x·H (se comprueba en cada
+#    fichero: escala de x negativa y la proyección esperada; si cambia, error permanente y claro).
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
 import datetime as dt
 import json
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -25,15 +33,30 @@ import h5py
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from pyproj import Proj, Transformer
-from shapely import contains_xy, prepare
+from shapely import contains_xy, distance, points, prepare
 from shapely.geometry import shape
 from shapely.ops import transform as stransform
 
 H = 35786400.0
-GEOS = Proj(proj="geos", h=H, lon_0=0, sweep="y", a=6378137, b=6356752.31424518)
+A_EJE, B_EJE = 6378137.0, 6356752.31424518
+GEOS = Proj(proj="geos", h=H, lon_0=0, sweep="y", a=A_EJE, b=B_EJE)
 A_UTM = Transformer.from_crs(4326, 25830, always_xy=True)
 VENTANA_MIN = 60          # «la última hora»: barridos anteriores que sirven de fondo
-MIN_VALIDOS = 3           # barridos despejados que hacen falta en esa hora para juzgar un píxel
+MIN_VALIDOS = 3           # barridos con fondo válido que hacen falta en esa hora para juzgar un píxel
+VIS_RADIO_KM = 2.0        # «vis»: nubes a ≤ 2 km de cada sitio con calor reciente
+VIS_HORAS = 24            #        sitios de los barridos de las últimas 24 h (y el actual)
+VIS_TOPE = 60             #        como mucho 60 sitios (los más recientes)
+MAX_PIX = 50              # píxeles con calor que se apuntan por barrido (calor[]); «vis» solo usa esos
+MARGEN_PX = 13            # filas/columnas alrededor de la zona: el resultado de un píxel depende de hasta
+                          # 12 píxeles (mediana 5 + dilatación 2 + mediana de la prueba de nubes 5)
+# pixel_quality (bits): 1 missing, 2 radiometric, 4 noise, 8 geolocation, 16 saturation, 32 straylight,
+# 64 extended_dynamic_range, 128 encoding_saturation. Se descartan los que falsean la radiancia o la posición;
+# la saturación y el rango extendido NO (los da un fuego de verdad: descartarlos taparía los más fuertes).
+CALIDAD_MALA = 1 | 2 | 4 | 8 | 32
+
+
+class ErrorPermanente(ValueError):
+    """El fichero o la configuración no valen para este análisis: no tiene sentido reintentar el barrido."""
 
 
 @dataclass
@@ -45,13 +68,16 @@ class Parametros:
     nube_fria: float = 265.0     # K, BT105
     nube_salto: float = 3.0      # K
     dilatacion: int = 2          # píxeles
+    calor_propio: float = 8.0    # K (G4): S38 y SD+margen_td de un píxel sin nube propia que nunca es nube
+    congelar_max_min: int = 360  # min (G5): como mucho 6 h seguidas con el fondo congelado
 
 
 class Zona:
-    """Término municipal (GeoJSON) + margen en km. Calcula la caja de recorte en lat/lon."""
+    """Término municipal (GeoJSON) + margen en km. Calcula la caja de la zona en lat/lon."""
 
     def __init__(self, ruta_geojson: str, margen_km: float, nombre: Optional[str] = None):
-        fc = json.load(open(ruta_geojson, encoding="utf-8"))
+        with open(ruta_geojson, encoding="utf-8") as f:
+            fc = json.load(f)
         feat = fc["features"][0] if fc.get("type") == "FeatureCollection" else fc
         geom = shape(feat["geometry"])
         self.nombre = nombre or feat.get("properties", {}).get("nombre", "zona")
@@ -63,8 +89,7 @@ class Zona:
         a_geo = Transformer.from_crs(25830, 4326, always_xy=True).transform
         self.zona_geo = stransform(a_geo, self.zona)
         w, s, e, n = self.zona_geo.bounds
-        # recorte = caja de la zona + 0,15° en latitud y 0,2° en longitud (para la mediana 11×11 en los bordes)
-        self.caja = (s - 0.15, n + 0.15, w - 0.2, e + 0.2)
+        self.caja = (s, n, w, e)          # el margen para las medianas se añade en píxeles (MARGEN_PX)
         c = self.muni.centroid
         self.centro = Transformer.from_crs(25830, 4326, always_xy=True).transform(c.x, c.y)  # (lon, lat)
 
@@ -84,12 +109,43 @@ class Recorte:
     en_muni: np.ndarray
     dist_muni_km: np.ndarray
 
+    @property
+    def clave(self) -> tuple:
+        """Filas y columnas del trozo: si cambian, el fondo anterior no vale (otros píxeles)."""
+        return (int(self.filas.start), int(self.filas.stop), int(self.cols.start), int(self.cols.stop))
+
 
 _RECORTES: dict = {}
 
 
+def _attr(a, k):
+    v = a[k]
+    if isinstance(v, np.ndarray):
+        v = v.ravel()[0] if v.size else None
+    if isinstance(v, bytes):
+        v = v.decode()
+    return v
+
+
+def comprobar_proyeccion(h, m) -> None:
+    """La geolocalización supone la proyección de MTG en 0° y el eje x en espejo: si el fichero dice otra cosa, error."""
+    try:
+        pr = h["data/mtg_geos_projection"].attrs
+        esperado = {"perspective_point_height": H, "longitude_of_projection_origin": 0.0,
+                    "semi_major_axis": A_EJE, "semi_minor_axis": B_EJE}
+        malos = [f"{k}={_attr(pr, k)}" for k, v in esperado.items() if not math.isclose(float(_attr(pr, k)), v, abs_tol=1e-3)]
+        if str(_attr(pr, "sweep_angle_axis")).strip().lower() != "y":
+            malos.append(f"sweep_angle_axis={_attr(pr, 'sweep_angle_axis')}")
+    except KeyError as ex:
+        raise ErrorPermanente(f"el fichero no trae la proyección (mtg_geos_projection): {ex}")
+    if float(m["x"].attrs["scale_factor"][0]) >= 0 or float(m["y"].attrs["scale_factor"][0]) <= 0:
+        malos.append("signo de las escalas de x/y (se espera x en espejo: escala de x negativa)")
+    if malos:
+        raise ErrorPermanente("la proyección del fichero no es la esperada (revisar la geolocalización): " + ", ".join(malos))
+
+
 def recorte(m, zona: Zona) -> Recorte:
-    """Filas/columnas del trozo que caen en la caja de la zona, con lat/lon de cada píxel (se calcula una vez)."""
+    """Filas/columnas del trozo con la zona + MARGEN_PX alrededor, con lat/lon de cada píxel (se calcula una vez)."""
     x, y = m["x"], m["y"]
     xa = x[()] * x.attrs["scale_factor"][0] + x.attrs["add_offset"][0]
     ya = y[()] * y.attrs["scale_factor"][0] + y.attrs["add_offset"][0]
@@ -105,25 +161,26 @@ def recorte(m, zona: Zona) -> Recorte:
     cols = np.where((xa >= ang_x.min() - 1e-4) & (xa <= ang_x.max() + 1e-4))[0]
     filas = np.where((ya >= ang_y.min() - 1e-4) & (ya <= ang_y.max() + 1e-4))[0]
     if len(cols) == 0 or len(filas) == 0:
-        raise ValueError("la zona no cae en este trozo")
-    XX, YY = np.meshgrid(-xa[cols.min():cols.max() + 1] * H, ya[filas.min():filas.max() + 1] * H)
+        raise ErrorPermanente("la zona no cae en este trozo")
+    extra = MARGEN_PX + 2
+    r0, r1 = max(0, filas.min() - extra), min(len(ya), filas.max() + extra + 1)
+    c0, c1 = max(0, cols.min() - extra), min(len(xa), cols.max() + extra + 1)
+    XX, YY = np.meshgrid(-xa[c0:c1] * H, ya[r0:r1] * H)
     lon, lat = GEOS(XX, YY, inverse=True)
     lon = np.where(np.abs(lon) > 360, np.nan, lon)
     lat = np.where(np.abs(lat) > 90, np.nan, lat)
-    # misma definición que el análisis validado: filas/columnas cuyos píxeles caen dentro de la caja
-    dentro = (lat > la0) & (lat < la1) & (lon > lo0) & (lon < lo1)
-    f, c = np.where(dentro)
-    if len(f) == 0:
-        raise ValueError("la zona no cae en este trozo")
-    f0, f1, c0, c1 = f.min(), f.max() + 1, c.min(), c.max() + 1
-    lat, lon = lat[f0:f1, c0:c1], lon[f0:f1, c0:c1]
     ex, ny = A_UTM.transform(lon, lat)
+    zf, zc = np.where(contains_xy(zona.zona, ex, ny))
+    if len(zf) == 0:
+        raise ErrorPermanente("la zona no cae en este trozo")
+    f0, f1, k0, k1 = zf.min() - MARGEN_PX, zf.max() + MARGEN_PX + 1, zc.min() - MARGEN_PX, zc.max() + MARGEN_PX + 1
+    if f0 < 0 or k0 < 0 or f1 > lat.shape[0] or k1 > lat.shape[1]:
+        raise ErrorPermanente(f"la zona está a menos de {MARGEN_PX} píxeles del borde del trozo")
+    lat, lon, ex, ny = lat[f0:f1, k0:k1], lon[f0:f1, k0:k1], ex[f0:f1, k0:k1], ny[f0:f1, k0:k1]
     en_zona = contains_xy(zona.zona, ex, ny)
     en_muni = contains_xy(zona.muni, ex, ny)
-    from shapely import distance, points
     dist = np.where(en_muni, 0.0, distance(zona.muni, points(ex, ny)) / 1000.0)
-    r = Recorte(slice(filas.min() + f0, filas.min() + f1), slice(cols.min() + c0, cols.min() + c1),
-                lat, lon, en_zona, en_muni, dist)
+    r = Recorte(slice(int(r0 + f0), int(r0 + f1)), slice(int(c0 + k0), int(c0 + k1)), lat, lon, en_zona, en_muni, dist)
     _RECORTES[clave] = r
     return r
 
@@ -136,10 +193,17 @@ def _bt(m, rec: Recorte) -> np.ndarray:
     frio = v * a["scale_factor"][0] + a["add_offset"][0]
     ws = a["warm_scale_factor"][0] if "warm_scale_factor" in a else 0.0
     wo = a["warm_add_offset"][0] if "warm_add_offset" in a else 0.0
-    rad = np.where((v > 4095) & (ws != 0), v * ws + wo, frio)   # 3,8 µm: rango extendido para lo caliente
-    rad[v == 65535] = np.nan
+    frio_max = a["valid_cold_range"][1] if "valid_cold_range" in a else 4095
+    rad = np.where((v > frio_max) & (ws != 0), v * ws + wo, frio)   # 3,8 µm: rango extendido para lo caliente
+    malo = v == (a["_FillValue"][0] if "_FillValue" in a else 65535)
+    malo |= v == 65535
+    if "valid_range" in a:
+        malo |= (v < a["valid_range"][0]) | (v > a["valid_range"][1])
+    if "pixel_quality" in m:
+        malo |= (m["pixel_quality"][rec.filas, rec.cols] & CALIDAD_MALA) != 0
+    rad[malo] = np.nan
     rad[rad <= 0] = np.nan
-    k = {n: float(m[f"radiance_to_bt_conversion_{n}"][()]) for n in
+    k = {n: float(np.asarray(m[f"radiance_to_bt_conversion_{n}"][()]).ravel()[0]) for n in
          ("coefficient_a", "coefficient_b", "coefficient_wavenumber", "constant_c1", "constant_c2")}
     wn = k["coefficient_wavenumber"]
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -149,6 +213,7 @@ def _bt(m, rec: Recorte) -> np.ndarray:
 def leer_trozo(ruta: str, zona: Zona) -> tuple[np.ndarray, np.ndarray, Recorte]:
     with h5py.File(ruta, "r") as h:
         m38, m105 = h["data/ir_38_hr/measured"], h["data/ir_105_hr/measured"]
+        comprobar_proyeccion(h, m38)
         rec = recorte(m38, zona)
         return _bt(m38, rec), _bt(m105, rec), rec
 
@@ -156,11 +221,9 @@ def leer_trozo(ruta: str, zona: Zona) -> tuple[np.ndarray, np.ndarray, Recorte]:
 def nanmed_espacial(a: np.ndarray, k: int = 11) -> np.ndarray:
     p = k // 2
     pad = np.pad(a, p, mode="edge")
-    with np.errstate(all="ignore"):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            return np.nanmedian(sliding_window_view(pad, (k, k)), axis=(-2, -1))
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmedian(sliding_window_view(pad, (k, k)), axis=(-2, -1))
 
 
 def dilatar(m: np.ndarray, it: int) -> np.ndarray:
@@ -177,7 +240,6 @@ def dilatar(m: np.ndarray, it: int) -> np.ndarray:
 
 
 def _nanmed_t(pila: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    import warnings
     s = np.stack(pila)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -199,10 +261,55 @@ def elevacion_solar(t: dt.datetime, lat: float, lon: float) -> float:
     return 90 - math.degrees(math.acos(max(-1.0, min(1.0, cz))))
 
 
+def _slot_iso(s) -> Optional[dt.datetime]:
+    try:
+        t = dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def sitios_recientes(slot: dt.datetime, actuales: list, previos: Optional[list]) -> list:
+    """Posiciones (lat, lon tal cual salen en calor[]) con calor en este barrido y en los de las VIS_HORAS anteriores,
+    sin repetir y como mucho VIS_TOPE: primero las del barrido actual, luego de más reciente a más antiguo."""
+    out, vistos = [], set()
+
+    def poner(c):
+        k = (c["lat"], c["lon"])
+        if k not in vistos and len(out) < VIS_TOPE:
+            vistos.add(k)
+            out.append(k)
+
+    for c in actuales[:MAX_PIX]:          # los mismos que salen en calor[]: el consumidor no conoce otros
+        poner(c)
+    desde = slot - dt.timedelta(hours=VIS_HORAS)
+    for t, b in sorted(((_slot_iso(b.get("slot")), b) for b in (previos or []) if isinstance(b, dict)),
+                       key=lambda x: x[0] or desde, reverse=True):
+        if t is None or not (desde <= t < slot):
+            continue
+        for c in b.get("calor") or []:
+            poner(c)
+    return out
+
+
+def visibilidad(rec: Recorte, nube: np.ndarray, sitios: list) -> list:
+    """[[lat, lon, pct], …]: % de píxeles del RECORTE a ≤ VIS_RADIO_KM de cada sitio que son nube en la máscara FINAL
+    del barrido (dilatada; los píxeles con calor propio no cuentan como nube; sin datos = nube). Sin píxeles cerca: 100."""
+    out = []
+    for la_s, lo_s in sitios:
+        with np.errstate(invalid="ignore"):
+            d = np.hypot((rec.lat - la_s) * 111.2, (rec.lon - lo_s) * 111.2 * math.cos(math.radians(la_s)))
+            cerca = d <= VIS_RADIO_KM
+        n = int(cerca.sum())
+        out.append([la_s, lo_s, round(100.0 * float(nube[cerca].sum()) / n, 1) if n else 100.0])
+    return out
+
+
 @dataclass
 class _Historico:
     slot: dt.datetime
-    S38: np.ndarray
+    clave: tuple
+    S38: np.ndarray        # lo que este barrido deja como fondo (congelado en los píxeles con calor: G5)
     SD: np.ndarray
     b105: np.ndarray
 
@@ -212,42 +319,76 @@ class Motor:
     zona: Zona
     p: Parametros = field(default_factory=Parametros)
     hist: list = field(default_factory=list)
+    desde: Optional[np.ndarray] = None       # G5: minuto (desde 1970) en que empezó la racha de calor de cada píxel
+    clave_desde: Optional[tuple] = None
 
-    def _previos(self, slot: dt.datetime) -> list:
-        return [h for h in self.hist if slot - dt.timedelta(minutes=VENTANA_MIN) <= h.slot < slot]
+    def _previos(self, slot: dt.datetime, clave: tuple) -> list:
+        return [h for h in self.hist
+                if slot - dt.timedelta(minutes=VENTANA_MIN) <= h.slot < slot and h.clave == clave]
 
-    def procesa(self, slot: dt.datetime, b38: np.ndarray, b105: np.ndarray, rec: Recorte) -> dict:
-        """Analiza un barrido. Devuelve el resultado (y guarda lo necesario para los siguientes)."""
+    def mascara(self, b38: np.ndarray, b105: np.ndarray, prev: list):
+        """Nubes y anomalías espaciales de un barrido: (nube, S38, SD, referencia temporal de BT105 o None)."""
         p = self.p
-        prev = [h for h in self._previos(slot) if h.S38.shape == b38.shape]   # si cambia la rejilla, fondo nuevo
         D = b38 - b105
+        ref = None
         if np.all(np.isnan(b105)):
             nube = np.ones(b38.shape, bool)
         else:
-            nube = (b105 < p.nube_fria) | (b105 - nanmed_espacial(b105) < -p.nube_salto)
-            if prev:
-                ref, _ = _nanmed_t([h.b105 for h in prev])
-                with np.errstate(invalid="ignore"):
-                    nube |= (b105 - ref) < -p.nube_salto
-            nube |= np.isnan(b38) | np.isnan(b105)
-            nube = dilatar(nube, p.dilatacion)
+            with np.errstate(invalid="ignore"):
+                propia = (b105 < p.nube_fria) | (b105 - nanmed_espacial(b105) < -p.nube_salto)
+                if prev:
+                    ref, _ = _nanmed_t([h.b105 for h in prev])
+                    propia |= (b105 - ref) < -p.nube_salto
+                propia |= np.isnan(b38) | np.isnan(b105)
+                nube = dilatar(propia, p.dilatacion)
+                # G4: un píxel sin nube propia y con calor propio claro no es nube aunque lo rodeen (humo del fuego)
+                bp, dp = np.where(propia, np.nan, b38), np.where(propia, np.nan, D)
+                calor_propio = ~propia & (bp - nanmed_espacial(bp) >= p.calor_propio) \
+                    & (dp - nanmed_espacial(dp) >= p.calor_propio - p.margen_td)
+                nube &= ~calor_propio
         b = np.where(nube, np.nan, b38)
         d = np.where(nube, np.nan, D)
-        S38 = b - nanmed_espacial(b)
-        SD = d - nanmed_espacial(d)
+        return nube, b - nanmed_espacial(b), d - nanmed_espacial(d), ref
+
+    def procesa(self, slot: dt.datetime, b38: np.ndarray, b105: np.ndarray, rec: Recorte,
+                previos: Optional[list] = None, tardio: bool = False) -> dict:
+        """Analiza un barrido. Devuelve el resultado (y guarda lo necesario para los siguientes).
+        previos: barridos ya apuntados (como en /estado), para «vis» (nubes sobre los sitios con calor de las últimas 24 h).
+        tardio: barrido publicado detrás de otros más nuevos ya analizados: no toca las rachas de calor (G5) y, en los
+        píxeles con racha abierta, deja en el fondo el fondo que ya había (no altera el fondo congelado de los posteriores)."""
+        p = self.p
+        clave = rec.clave
+        prev = self._previos(slot, clave)          # si cambian filas/columnas, fondo nuevo
+        nube, S38, SD, ref = self.mascara(b38, b105, prev)
         if prev:
             m38, val = _nanmed_t([h.S38 for h in prev])
             mD, _ = _nanmed_t([h.SD for h in prev])
             T38, TD = S38 - m38, SD - mD
         else:
+            m38 = mD = None
             val = np.zeros(b38.shape, int)
             T38 = TD = np.full(b38.shape, np.nan)
         ok = (val >= MIN_VALIDOS) & ~nube & rec.en_zona
         with np.errstate(invalid="ignore"):
             calor = ok & (T38 > p.umbral) & (TD > p.umbral - p.margen_td) & ((TD - T38) <= p.sol)
+        # G5: racha de calor de cada píxel y fondo congelado mientras dure (como mucho congelar_max_min)
+        if self.desde is None or self.clave_desde != clave or self.desde.shape != b38.shape:
+            self.desde, self.clave_desde = np.full(b38.shape, np.nan), clave
+        t = slot.timestamp() / 60
+        if tardio:
+            cong = (calor | ~np.isnan(self.desde)) if prev else np.zeros(b38.shape, bool)
+        else:
+            self.desde[calor & np.isnan(self.desde)] = t
+            self.desde[ok & ~calor] = np.nan
+            with np.errstate(invalid="ignore"):
+                cong = calor & (t - self.desde < p.congelar_max_min)
+        S38f, SDf, b105f = S38, SD, b105
+        if cong.any():
+            S38f, SDf = np.where(cong, m38, S38), np.where(cong, mD, SD)
+            b105f = np.where(cong, ref, b105) if ref is not None else b105
         # guardar para los barridos siguientes (solo la última hora)
         self.hist = [h for h in self.hist if h.slot >= slot - dt.timedelta(minutes=VENTANA_MIN) and h.slot != slot] + \
-                    [_Historico(slot, S38.astype(np.float32), SD.astype(np.float32), b105.astype(np.float32))]
+                    [_Historico(slot, clave, S38f.astype(np.float32), SDf.astype(np.float32), b105f.astype(np.float32))]
         zona = rec.en_zona
         n_zona = int(zona.sum())
         pix = []
@@ -259,6 +400,7 @@ class Motor:
                 "en": "municipio" if rec.en_muni[r, c] else "margen",
                 "dist_km": round(float(rec.dist_muni_km[r, c]), 2),
                 "intenso": bool(T38[r, c] >= p.intenso),
+                "racha_min": None if tardio or np.isnan(self.desde[r, c]) else int(round(t - self.desde[r, c])),
             })
         pix.sort(key=lambda x: -x["t38"])
         # la señal más alta de la zona aunque no llegue al umbral (para el widget)
@@ -273,8 +415,37 @@ class Motor:
             "nube_pct": round(100 * float(nube[zona].mean()), 1) if n_zona else None,
             "pix_zona": n_zona,
             "pix_vigilados": int(ok.sum()),          # despejados y con fondo suficiente
+            "cobertura_pct": round(100 * float(ok.sum()) / n_zona, 1) if n_zona else None,
             "fondo_barridos": len(prev),
+            "pix_fondo_congelado": int(cong.sum()),
             "sol_elev": round(elevacion_solar(slot + dt.timedelta(minutes=8), lat_c, lon_c), 1),
             "calor": pix,
             "maximo": maximo,
+            "vis": visibilidad(rec, nube, sitios_recientes(slot, pix, previos)),
         }
+
+    # ---------------------------------------------------------------- fondo en disco (reinicios)
+    def estado_fondo(self) -> Optional[dict]:
+        """Arrays para np.savez: el fondo de la última hora y las rachas de calor (sin objetos: allow_pickle=False)."""
+        if not self.hist:
+            return None
+        clave = self.hist[-1].clave
+        hs = sorted((h for h in self.hist if h.clave == clave), key=lambda h: h.slot)
+        d = {"slots": np.array([int(h.slot.timestamp()) for h in hs], np.int64), "clave": np.array(clave, np.int64),
+             "S38": np.stack([h.S38 for h in hs]), "SD": np.stack([h.SD for h in hs]), "b105": np.stack([h.b105 for h in hs])}
+        if self.desde is not None and self.clave_desde == clave:
+            d["desde"] = self.desde
+        return d
+
+    def cargar_fondo(self, d) -> None:
+        clave = tuple(int(x) for x in d["clave"])
+        S38, SD, b105 = d["S38"], d["SD"], d["b105"]
+        if not (len(d["slots"]) == len(S38) == len(SD) == len(b105)) or S38.shape != SD.shape or S38.shape != b105.shape:
+            raise ValueError("fondo.npz incoherente")
+        self.hist = [_Historico(dt.datetime.fromtimestamp(int(s), dt.timezone.utc), clave,
+                                S38[i].astype(np.float32), SD[i].astype(np.float32), b105[i].astype(np.float32))
+                     for i, s in enumerate(d["slots"])]
+        if "desde" in d and d["desde"].shape == S38.shape[1:]:
+            self.desde, self.clave_desde = np.array(d["desde"], np.float64), clave
+        else:
+            self.desde, self.clave_desde = None, None
