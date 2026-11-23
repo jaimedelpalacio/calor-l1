@@ -47,8 +47,10 @@ VIS_RADIO_KM = 2.0        # «vis»: nubes a ≤ 2 km de cada sitio con calor re
 VIS_HORAS = 24            #        sitios de los barridos de las últimas 24 h (y el actual)
 VIS_TOPE = 60             #        como mucho 60 sitios (los más recientes)
 MAX_PIX = 50              # píxeles con calor que se apuntan por barrido (calor[]); «vis» solo usa esos
-MARGEN_PX = 13            # filas/columnas alrededor de la zona: el resultado de un píxel depende de hasta
-                          # 12 píxeles (mediana 5 + dilatación 2 + mediana de la prueba de nubes 5)
+MARGEN_PX = 15            # filas/columnas alrededor de la zona: el resultado de un píxel depende de hasta 15 píxeles:
+                          # su ventana 11×11 (5) → nube de un vecino, que con G4 depende del calor propio de ese vecino
+                          # (mediana 5 de sus vecinos sin nube propia) → nube propia de estos (mediana de BT105, 5).
+                          # Sin G4 bastaban 12 (5 + dilatación 2 + 5); G6 (vecinos despejados, 5) no pasa de 15.
 # pixel_quality (bits): 1 missing, 2 radiometric, 4 noise, 8 geolocation, 16 saturation, 32 straylight,
 # 64 extended_dynamic_range, 128 encoding_saturation. Se descartan los que falsean la radiancia o la posición;
 # la saturación y el rango extendido NO (los da un fuego de verdad: descartarlos taparía los más fuertes).
@@ -70,6 +72,8 @@ class Parametros:
     dilatacion: int = 2          # píxeles
     calor_propio: float = 8.0    # K (G4): S38 y SD+margen_td de un píxel sin nube propia que nunca es nube
     congelar_max_min: int = 360  # min (G5): como mucho 6 h seguidas con el fondo congelado
+    vecinos_min: float = 0.65    # (G6) fracción mínima de vecinos despejados en la ventana 11×11 para juzgar un píxel
+                                 # (Hally y otros 2018: el fondo contextual se degrada con pocos vecinos válidos)
 
 
 class Zona:
@@ -218,6 +222,13 @@ def leer_trozo(ruta: str, zona: Zona) -> tuple[np.ndarray, np.ndarray, Recorte]:
         return _bt(m38, rec), _bt(m105, rec), rec
 
 
+def frac_despejados(nube: np.ndarray, k: int = 11) -> np.ndarray:
+    """Fracción de píxeles sin nube en la ventana k×k de cada píxel (borde replicado), contando cuántos hay (exacto)."""
+    p = k // 2
+    pad = np.pad(~nube, p, mode="edge")
+    return sliding_window_view(pad, (k, k)).sum(axis=(-2, -1)) / (k * k)
+
+
 def nanmed_espacial(a: np.ndarray, k: int = 11) -> np.ndarray:
     p = k // 2
     pad = np.pad(a, p, mode="edge")
@@ -293,8 +304,9 @@ def sitios_recientes(slot: dt.datetime, actuales: list, previos: Optional[list])
 
 
 def visibilidad(rec: Recorte, nube: np.ndarray, sitios: list) -> list:
-    """[[lat, lon, pct], …]: % de píxeles del RECORTE a ≤ VIS_RADIO_KM de cada sitio que son nube en la máscara FINAL
-    del barrido (dilatada; los píxeles con calor propio no cuentan como nube; sin datos = nube). Sin píxeles cerca: 100."""
+    """[[lat, lon, pct], …]: % de píxeles del RECORTE a ≤ VIS_RADIO_KM de cada sitio que no se ven según «nube»: el
+    motor le pasa la máscara FINAL del barrido (dilatada; los píxeles con calor propio no son nube; sin datos = nube)
+    más los que no se pueden juzgar por falta de vecinos despejados (G6). Sin píxeles cerca: 100."""
     out = []
     for la_s, lo_s in sitios:
         with np.errstate(invalid="ignore"):
@@ -327,10 +339,12 @@ class Motor:
                 if slot - dt.timedelta(minutes=VENTANA_MIN) <= h.slot < slot and h.clave == clave]
 
     def mascara(self, b38: np.ndarray, b105: np.ndarray, prev: list):
-        """Nubes y anomalías espaciales de un barrido: (nube, S38, SD, referencia temporal de BT105 o None)."""
+        """Nubes y anomalías espaciales de un barrido:
+        (nube, S38, SD, referencia temporal de BT105 o None, calor_propio de G4)."""
         p = self.p
         D = b38 - b105
         ref = None
+        calor_propio = np.zeros(b38.shape, bool)
         if np.all(np.isnan(b105)):
             nube = np.ones(b38.shape, bool)
         else:
@@ -348,7 +362,7 @@ class Motor:
                 nube &= ~calor_propio
         b = np.where(nube, np.nan, b38)
         d = np.where(nube, np.nan, D)
-        return nube, b - nanmed_espacial(b), d - nanmed_espacial(d), ref
+        return nube, b - nanmed_espacial(b), d - nanmed_espacial(d), ref, calor_propio
 
     def procesa(self, slot: dt.datetime, b38: np.ndarray, b105: np.ndarray, rec: Recorte,
                 previos: Optional[list] = None, tardio: bool = False) -> dict:
@@ -359,7 +373,7 @@ class Motor:
         p = self.p
         clave = rec.clave
         prev = self._previos(slot, clave)          # si cambian filas/columnas, fondo nuevo
-        nube, S38, SD, ref = self.mascara(b38, b105, prev)
+        nube, S38, SD, ref, calor_propio = self.mascara(b38, b105, prev)
         if prev:
             m38, val = _nanmed_t([h.S38 for h in prev])
             mD, _ = _nanmed_t([h.SD for h in prev])
@@ -368,7 +382,11 @@ class Motor:
             m38 = mD = None
             val = np.zeros(b38.shape, int)
             T38 = TD = np.full(b38.shape, np.nan)
-        ok = (val >= MIN_VALIDOS) & ~nube & rec.en_zona
+        con_fondo = (val >= MIN_VALIDOS) & ~nube & rec.en_zona     # despejados, en la zona y con fondo (antes de G6)
+        # G6: sin un 65 % de vecinos despejados el fondo no es fiable (bordes de nube): el píxel no se juzga,
+        # salvo que tenga calor propio (G4): G6 no anula a G4
+        vecinos = frac_despejados(nube) >= p.vecinos_min
+        ok = con_fondo & (vecinos | calor_propio)
         with np.errstate(invalid="ignore"):
             calor = ok & (T38 > p.umbral) & (TD > p.umbral - p.margen_td) & ((TD - T38) <= p.sol)
         # G5: racha de calor de cada píxel y fondo congelado mientras dure (como mucho congelar_max_min)
@@ -380,12 +398,17 @@ class Motor:
         else:
             self.desde[calor & np.isnan(self.desde)] = t
             self.desde[ok & ~calor] = np.nan
+            # también los de racha abierta que hoy no se juzgan (despejados pero sin vecinos, G6): su valor caliente
+            # no debe entrar en el fondo, o al volver a juzgarse el incendio se callaría
+            sin_juzgar = ~nube & rec.en_zona & ~ok & ~np.isnan(self.desde)
             with np.errstate(invalid="ignore"):
-                cong = calor & (t - self.desde < p.congelar_max_min)
+                cong = (calor | sin_juzgar) & (t - self.desde < p.congelar_max_min)
         S38f, SDf, b105f = S38, SD, b105
-        if cong.any():
-            S38f, SDf = np.where(cong, m38, S38), np.where(cong, mD, SD)
-            b105f = np.where(cong, ref, b105) if ref is not None else b105
+        if cong.any():                               # sin fondo en la última hora, lo congelado queda sin dato
+            nan = np.full(b38.shape, np.nan)
+            S38f = np.where(cong, m38 if m38 is not None else nan, S38)
+            SDf = np.where(cong, mD if mD is not None else nan, SD)
+            b105f = np.where(cong, ref if ref is not None else nan, b105)
         # guardar para los barridos siguientes (solo la última hora)
         self.hist = [h for h in self.hist if h.slot >= slot - dt.timedelta(minutes=VENTANA_MIN) and h.slot != slot] + \
                     [_Historico(slot, clave, S38f.astype(np.float32), SDf.astype(np.float32), b105f.astype(np.float32))]
@@ -414,14 +437,16 @@ class Motor:
         return {
             "nube_pct": round(100 * float(nube[zona].mean()), 1) if n_zona else None,
             "pix_zona": n_zona,
-            "pix_vigilados": int(ok.sum()),          # despejados y con fondo suficiente
+            "pix_con_fondo": int(con_fondo.sum()),   # despejados, en la zona y con fondo (antes de G6)
+            "pix_vigilados": int(ok.sum()),          # juzgados: con fondo y con vecinos despejados (G6) o calor propio (G4)
             "cobertura_pct": round(100 * float(ok.sum()) / n_zona, 1) if n_zona else None,
             "fondo_barridos": len(prev),
             "pix_fondo_congelado": int(cong.sum()),
             "sol_elev": round(elevacion_solar(slot + dt.timedelta(minutes=8), lat_c, lon_c), 1),
             "calor": pix,
             "maximo": maximo,
-            "vis": visibilidad(rec, nube, sitios_recientes(slot, pix, previos)),
+            # «vis»: lo que no se puede juzgar por falta de vecinos despejados (G6) tampoco «se ve»
+            "vis": visibilidad(rec, nube | (~vecinos & ~calor_propio), sitios_recientes(slot, pix, previos)),
         }
 
     # ---------------------------------------------------------------- fondo en disco (reinicios)

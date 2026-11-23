@@ -18,6 +18,8 @@
 #
 # /health dice «ok» SOLO si de verdad está vigilando: token bien, disco persistente, bucle vivo,
 # barrido analizado hace < 30 min, sin fallos seguidos, con fondo suficiente y con ≥ 50 % de la zona vigilada.
+# Sin nada juzgado: «nublado» si es por las nubes (también claros sueltos sin el 65 % de vecinos despejados, G6);
+# «sin_fondo» solo si de verdad falta la hora de fondo.
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -382,11 +384,12 @@ class Servicio:
             estado = "arrancando"
         elif edad is not None and edad > ATRASO_MIN:
             estado = "atrasado"
-        elif uok.get("fondo_barridos", 0) >= MIN_VALIDOS and uok.get("pix_vigilados", 0) == 0 \
-                and (uok.get("nube_pct") or 0) >= 95:
-            estado = "nublado"                           # todo cubierto: no se ve el suelo
+        elif uok.get("pix_vigilados", 0) == 0 and (uok.get("pix_con_fondo", 0) > 0 or (
+                uok.get("fondo_barridos", 0) >= MIN_VALIDOS and (uok.get("nube_pct") or 0) >= 95)):
+            # nada juzgado por las nubes: todo cubierto, o los claros con fondo no tienen vecinos despejados (G6)
+            estado = "nublado"
         elif not uok.get("vigilado"):
-            estado = "arrancando" if en_marcha_min < 45 else "sin_fondo"
+            estado = "arrancando" if en_marcha_min < 45 else "sin_fondo"   # falta de verdad el fondo
         elif cobertura is not None and cobertura < COBERTURA_MIN:
             estado = "parcial"                           # se vigila, pero menos de la mitad de la zona
         else:
