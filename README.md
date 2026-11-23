@@ -1,6 +1,6 @@
 # calor-l1
 
-Vigilancia de **calor** en una zona (hoy: Alcalá de Guadaíra + 5 km) con el **nivel 1 de MTG FCI**
+Vigilancia de **calor** en una zona (hoy: Alcalá de Guadaíra + 1 km) con el **nivel 1 de MTG FCI**
 (alta resolución, canales de 3,8 y 10,5 µm a 1 km, un barrido cada 10 min).
 
 > Investigación. Los datos de EUMETSAT de menos de 1 h se usan con la licencia de **investigación**
@@ -60,13 +60,13 @@ renueve deja sin acceso al otro. UN SOLO proceso por servicio (sin `--workers`).
 
 `API_KEY` (obligatoria para `/estado` y `/admin/token`; sin ella, 503), `DATA_DIR` (`/data`, debe ser un disco
 persistente), `EXIGIR_DISCO` (1; 0 solo en pruebas locales), `ZONA_GEOJSON`
-(`zonas/alcala.geojson`), `MARGEN_KM` (5), `UMBRAL` (4.5), `INTENSO` (8), `COLECCION` (`EO:EUM:DAT:0665`),
-`TROZO` (34), `INTERVALO_S` (60).
+(`zonas/alcala.geojson`), `MARGEN_KM` (5 en el código; en Render, 1 desde el 23-nov-2026), `UMBRAL` (4.5),
+`INTENSO` (8), `COLECCION` (`EO:EUM:DAT:0665`), `TROZO` (34), `INTERVALO_S` (60).
 
 ## Pruebas
 
 - `python pruebas/prueba_motor.py <carpeta investigacion-calor>`: el motor da exactamente las mismas alarmas
   que el análisis validado en los 10 días extraídos.
-- `DATA_DIR=<carpeta con tokens.json> python repaso.py 2026-05-13T20:00 2026-05-13T21:00`: pasa un periodo
+- `DATA_DIR=<carpeta con tokens.json> MARGEN_KM=1 python repaso.py 2026-05-13T20:00 2026-05-13T21:00`: pasa un periodo
   pasado por el mismo código del servicio (búsqueda, descarga, lectura y motor).
 - `python pruebas/arranque_local.py`: el servicio en local (puerto 8091, `API_KEY=prueba-local`).
