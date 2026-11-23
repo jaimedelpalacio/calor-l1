@@ -25,22 +25,41 @@ de la zona y aplica el análisis validado el 23-nov-2026 con 6 episodios reales 
 
 | Ruta | Qué devuelve |
 |---|---|
-| `GET /ping` | vida (comprobación de salud de Render) |
-| `GET /health` | `estado` = ok / arrancando / atrasado (> 30 min sin barrido) / sin_token / error; último barrido, token, última vuelta |
+| `GET /ping` | vida (comprobación de salud de Render); 503 si el bucle lleva > 15 min colgado, para que Render lo reinicie |
+| `GET /health` | `estado` (ver abajo), `vigilando` (true solo con «ok»), último barrido analizado, token, latido del bucle, barridos que se están reintentando |
 | `GET /estado?n=36` | últimos *n* barridos (máx. 144 = 24 h): hora de paso del satélite, creación del fichero, cuándo lo vimos y lo analizamos, retraso, % de nubes, píxeles vigilados, elevación del sol, señal máxima y **píxeles con calor**. Cabecera `X-API-Key` |
 | `GET /zona` | contorno de la zona vigilada (GeoJSON, línea), centro y parámetros |
 | `POST /admin/token` | `{"refresh_token": "…"}` carga el refresh token de EUMETSAT y lo prueba. Cabecera `X-API-Key` |
+
+### Estados de `/health`
+
+| estado | significado |
+|---|---|
+| `ok` | vigilando: último barrido analizado hace < 30 min, con fondo y con suelo visible |
+| `arrancando` | recién arrancado: aún no ha analizado un barrido en este proceso o le falta la hora de fondo |
+| `nublado` | zona cubierta (≥ 95 % de nubes): no se ve el suelo (no es un fallo, pero no se vigila) |
+| `sin_fondo` | > 45 min en marcha y sin una hora de barridos válidos detrás |
+| `atrasado` | > 30 min sin barrido analizado |
+| `error` | barridos que fallan (≥ 3 intentos), el último barrido apuntado con error, o 3 vueltas seguidas fallidas |
+| `parado` | el bucle lleva > 8 min sin latido |
+| `sin_disco` | no hay disco persistente en `DATA_DIR`, o el token renovado no se ha podido guardar |
+| `sin_token` | hay que volver a entrar en EUMETSAT y cargar un refresh token (`POST /admin/token`) |
+
+Un fallo pasajero al renovar el token (CAS caído) con el access todavía válido no cambia el estado: sale en `aviso_token`.
 
 ## Token de EUMETSAT
 
 La API v2 se autentica con el usuario del portal en el navegador (OAuth2 con PKCE). El servicio guarda
 **solo el refresh token**, en `DATA_DIR/tokens.json` (disco persistente): cada renovación da uno nuevo e
 invalida el anterior, así que no puede ir en una variable de entorno. Si `/health` dice `sin_token`,
-hay que volver a entrar en EUMETSAT y cargar uno nuevo con `POST /admin/token`.
+hay que volver a entrar en EUMETSAT y cargar uno nuevo con `POST /admin/token`. Cada entorno (Render, pruebas
+locales, `repaso.py`) necesita **su propio** inicio de sesión: si dos comparten un refresh token, el primero que
+renueve deja sin acceso al otro. UN SOLO proceso por servicio (sin `--workers`).
 
 ## Variables de entorno
 
-`API_KEY` (obligatoria para `/estado` y `/admin/token`), `DATA_DIR` (`/data`), `ZONA_GEOJSON`
+`API_KEY` (obligatoria para `/estado` y `/admin/token`; sin ella, 503), `DATA_DIR` (`/data`, debe ser un disco
+persistente), `EXIGIR_DISCO` (1; 0 solo en pruebas locales), `ZONA_GEOJSON`
 (`zonas/alcala.geojson`), `MARGEN_KM` (5), `UMBRAL` (4.5), `INTENSO` (8), `COLECCION` (`EO:EUM:DAT:0665`),
 `TROZO` (34), `INTERVALO_S` (60).
 
